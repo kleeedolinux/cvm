@@ -55,6 +55,28 @@ const (
 	FIELD
 	PERSIST
 	LOAD_PERSISTED
+
+	// I/O operations
+	PRINT
+	READ
+
+	// Global variables
+	GLOBAL_GET
+	GLOBAL_SET
+
+	// Object-oriented features
+	NEW_OBJECT
+	METHOD_CALL
+
+	// Error handling
+	TRY
+	THROW
+
+	// File operations
+	FILE_OPEN
+	FILE_CLOSE
+	FILE_READ
+	FILE_WRITE
 )
 
 type Instruction struct {
