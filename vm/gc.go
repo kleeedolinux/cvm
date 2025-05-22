@@ -37,6 +37,7 @@ type GC struct {
 	persistPath string
 	threshold   int
 	interval    time.Duration
+	memManager  *MemoryManager
 }
 
 func NewGC(persistPath string) *GC {
@@ -45,6 +46,7 @@ func NewGC(persistPath string) *GC {
 		persistPath: persistPath,
 		threshold:   1000,
 		interval:    time.Minute * 5,
+		memManager:  NewMemoryManager(),
 	}
 	go gc.startBackgroundGC()
 	return gc
@@ -57,7 +59,7 @@ func (gc *GC) Allocate(objType ObjectType, value interface{}) uint64 {
 	id := gc.nextID
 	gc.nextID++
 
-	gc.objects[id] = &Object{
+	obj := &Object{
 		Type:      objType,
 		Value:     value,
 		RefCount:  1,
@@ -66,6 +68,7 @@ func (gc *GC) Allocate(objType ObjectType, value interface{}) uint64 {
 		Metadata:  make(map[string]interface{}),
 	}
 
+	gc.objects[id] = obj
 	return id
 }
 

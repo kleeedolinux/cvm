@@ -1,11 +1,14 @@
 package vm
 
 import (
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,6 +35,8 @@ type VM struct {
 	debug        bool
 	globals      map[string]Value
 	types        map[string]*TypeInfo
+	memManager   *MemoryManager
+	crypto       *CryptoModule
 }
 
 type TypeInfo struct {
@@ -51,7 +56,7 @@ type MethodInfo struct {
 }
 
 func NewVM() *VM {
-	return &VM{
+	vm := &VM{
 		stack:        make([]Value, 0, 1024),
 		memory:       make(map[int]Value),
 		routines:     make(map[int]*VM),
@@ -65,7 +70,11 @@ func NewVM() *VM {
 		stdIn:        os.Stdin,
 		globals:      make(map[string]Value),
 		types:        make(map[string]*TypeInfo),
+		memManager:   NewMemoryManager(),
 	}
+	vm.crypto = NewCryptoModule(vm)
+	vm.crypto.RegisterFunctions()
+	return vm
 }
 
 func defaultErrorHandler(err error) {
@@ -151,6 +160,14 @@ func (vm *VM) Store(addr int, v Value) {
 		vm.gc.IncrementRef(newID)
 	}
 	vm.memory[addr] = v
+}
+
+func (vm *VM) allocateMemory(size uintptr) (uintptr, error) {
+	return vm.memManager.allocate(size)
+}
+
+func (vm *VM) freeMemory(ptr uintptr) {
+	vm.memManager.free(ptr)
 }
 
 func (vm *VM) Execute(code []Instruction) error {
@@ -276,18 +293,64 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 		}
 	case CALL:
 		if name, ok := instr.Value.(string); ok {
-			if code, exists := vm.functions[name]; exists {
-				vm.callStack = append(vm.callStack, vm.pc)
-				savedCode := vm.code
-				vm.code = code
-				vm.pc = -1 // Will be incremented to 0 after return
-				defer func() {
-					vm.pc = vm.callStack[len(vm.callStack)-1]
-					vm.callStack = vm.callStack[:len(vm.callStack)-1]
-					vm.code = savedCode
-				}()
-			} else {
-				return fmt.Errorf("function not found: %s", name)
+			switch name {
+			case "__crypto_sha256":
+				data := vm.Pop().([]byte)
+				hash := vm.crypto.SHA256(data)
+				vm.Push(hash)
+			case "__crypto_aes_encrypt":
+				key := vm.Pop().([]byte)
+				plaintext := vm.Pop().([]byte)
+				ciphertext, err := vm.crypto.AESEncrypt(key, plaintext)
+				if err != nil {
+					return err
+				}
+				vm.Push(ciphertext)
+			case "__crypto_aes_decrypt":
+				key := vm.Pop().([]byte)
+				ciphertext := vm.Pop().([]byte)
+				plaintext, err := vm.crypto.AESDecrypt(key, ciphertext)
+				if err != nil {
+					return err
+				}
+				vm.Push(plaintext)
+			case "__crypto_rsa_generate":
+				bits := vm.Pop().(int)
+				key, err := vm.crypto.RSAGenerate(bits)
+				if err != nil {
+					return err
+				}
+				vm.Push(key)
+			case "__crypto_rsa_encrypt":
+				plaintext := vm.Pop().([]byte)
+				publicKey := vm.Pop().(*rsa.PublicKey)
+				ciphertext, err := vm.crypto.RSAEncrypt(publicKey, plaintext)
+				if err != nil {
+					return err
+				}
+				vm.Push(ciphertext)
+			case "__crypto_rsa_decrypt":
+				ciphertext := vm.Pop().([]byte)
+				privateKey := vm.Pop().(*rsa.PrivateKey)
+				plaintext, err := vm.crypto.RSADecrypt(privateKey, ciphertext)
+				if err != nil {
+					return err
+				}
+				vm.Push(plaintext)
+			default:
+				if code, exists := vm.functions[name]; exists {
+					vm.callStack = append(vm.callStack, vm.pc)
+					savedCode := vm.code
+					vm.code = code
+					vm.pc = -1
+					defer func() {
+						vm.pc = vm.callStack[len(vm.callStack)-1]
+						vm.callStack = vm.callStack[:len(vm.callStack)-1]
+						vm.code = savedCode
+					}()
+				} else {
+					return fmt.Errorf("function not found: %s", name)
+				}
 			}
 		}
 	case RET:
@@ -558,6 +621,8 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 
 func (vm *VM) LoadLib(name string) error {
 	switch name {
+	case "crypto":
+		vm.crypto.RegisterFunctions()
 	case "math":
 		vm.RegisterFunction("abs", []Instruction{
 			{Op: PUSH, Value: 0},
@@ -632,4 +697,147 @@ func (vm *VM) LoadLib(name string) error {
 		return fmt.Errorf("unknown library: %s", name)
 	}
 	return nil
+}
+
+func (vm *VM) Parse(code string) ([]Instruction, error) {
+	var instructions []Instruction
+	lines := strings.Split(code, "\n")
+
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+
+		op := parts[0]
+		var value interface{}
+		if len(parts) > 1 {
+			valueStr := strings.Join(parts[1:], " ")
+			var err error
+			value, err = parseValue(valueStr)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: %v", i+1, err)
+			}
+		}
+
+		opCode, ok := opCodes[op]
+		if !ok {
+			return nil, fmt.Errorf("line %d: unknown opcode %s", i+1, op)
+		}
+
+		instructions = append(instructions, Instruction{
+			Op:    opCode,
+			Value: value,
+		})
+	}
+
+	return instructions, nil
+}
+
+func parseValue(valueStr string) (interface{}, error) {
+	if valueStr == "nil" {
+		return nil, nil
+	}
+
+	if valueStr == "true" {
+		return true, nil
+	}
+
+	if valueStr == "false" {
+		return false, nil
+	}
+
+	if num, err := strconv.Atoi(valueStr); err == nil {
+		return num, nil
+	}
+
+	if strings.HasPrefix(valueStr, "\"") && strings.HasSuffix(valueStr, "\"") {
+		return strings.Trim(valueStr, "\""), nil
+	}
+
+	if strings.HasPrefix(valueStr, "[") && strings.HasSuffix(valueStr, "]") {
+		inner := strings.Trim(valueStr, "[]")
+		parts := strings.Split(inner, ",")
+		var result []interface{}
+		for _, part := range parts {
+			val, err := parseValue(strings.TrimSpace(part))
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, val)
+		}
+		return result, nil
+	}
+
+	if strings.HasPrefix(valueStr, "{") && strings.HasSuffix(valueStr, "}") {
+		inner := strings.Trim(valueStr, "{}")
+		parts := strings.Split(inner, ",")
+		result := make(map[string]interface{})
+		for _, part := range parts {
+			kv := strings.SplitN(part, ":", 2)
+			if len(kv) != 2 {
+				return nil, fmt.Errorf("invalid map entry: %s", part)
+			}
+			key := strings.TrimSpace(kv[0])
+			val, err := parseValue(strings.TrimSpace(kv[1]))
+			if err != nil {
+				return nil, err
+			}
+			result[key] = val
+		}
+		return result, nil
+	}
+
+	return valueStr, nil
+}
+
+var opCodes = map[string]OpCode{
+	"PUSH":           PUSH,
+	"POP":            POP,
+	"ADD":            ADD,
+	"SUB":            SUB,
+	"MUL":            MUL,
+	"DIV":            DIV,
+	"MOD":            MOD,
+	"LOAD":           LOAD,
+	"STORE":          STORE,
+	"JMP":            JMP,
+	"JMPIF":          JMPIF,
+	"JMPIFNOT":       JMPIFNOT,
+	"CALL":           CALL,
+	"RET":            RET,
+	"SPAWN":          SPAWN,
+	"YIELD":          YIELD,
+	"JOIN":           JOIN,
+	"CHANNEL":        CHANNEL,
+	"SEND":           SEND,
+	"RECV":           RECV,
+	"SELECT":         SELECT,
+	"TIMER":          TIMER,
+	"LIST":           LIST,
+	"DICT":           DICT,
+	"STRUCT":         STRUCT,
+	"STRING":         STRING,
+	"APPEND":         APPEND,
+	"SET":            SET,
+	"FIELD":          FIELD,
+	"PERSIST":        PERSIST,
+	"LOAD_PERSISTED": LOAD_PERSISTED,
+	"PRINT":          PRINT,
+	"READ":           READ,
+	"GLOBAL_GET":     GLOBAL_GET,
+	"GLOBAL_SET":     GLOBAL_SET,
+	"NEW_OBJECT":     NEW_OBJECT,
+	"METHOD_CALL":    METHOD_CALL,
+	"TRY":            TRY,
+	"THROW":          THROW,
+	"FILE_OPEN":      FILE_OPEN,
+	"FILE_CLOSE":     FILE_CLOSE,
+	"FILE_READ":      FILE_READ,
+	"FILE_WRITE":     FILE_WRITE,
 }

@@ -29,6 +29,8 @@ func (o *Optimizer) Optimize(code []Instruction) []Instruction {
 	optimized := o.optimizeConstantFolding(code)
 	optimized = o.optimizeDeadCodeElimination(optimized)
 	optimized = o.optimizePeephole(optimized)
+	optimized = o.optimizeIOOperations(optimized)
+	optimized = o.optimizeNetworkOperations(optimized)
 
 	o.mutex.Lock()
 	if len(o.cache) >= o.maxCache {
@@ -155,4 +157,64 @@ func hashInstructions(code []Instruction) string {
 		}
 	}
 	return hash
+}
+
+func (o *Optimizer) optimizeIOOperations(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+1 < len(code) {
+			switch code[i].Op {
+			case WRITE_BYTES:
+				if code[i+1].Op == FLUSH {
+					result = append(result, Instruction{Op: SYNC, Value: code[i].Value})
+					i++
+					continue
+				}
+			case READ_BYTES:
+				if i+2 < len(code) && code[i+1].Op == BUFFER && code[i+2].Op == READ_BYTES {
+					result = append(result, Instruction{Op: BUFFERED_IO, Value: []interface{}{code[i].Value, code[i+2].Value}})
+					i += 2
+					continue
+				}
+			case FILE_READ:
+				if i+1 < len(code) && code[i+1].Op == BUFFER {
+					result = append(result, Instruction{Op: MMAP, Value: code[i].Value})
+					i++
+					continue
+				}
+			case FILE_WRITE:
+				if i+1 < len(code) && code[i+1].Op == SYNC {
+					result = append(result, Instruction{Op: DIRECT_IO, Value: code[i].Value})
+					i++
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeNetworkOperations(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+2 < len(code) {
+			switch code[i].Op {
+			case SOCKET:
+				if code[i+1].Op == BIND && code[i+2].Op == LISTEN {
+					result = append(result, Instruction{Op: LISTEN, Value: []interface{}{code[i].Value, code[i+1].Value}})
+					i += 2
+					continue
+				}
+			case SEND_TO:
+				if i+1 < len(code) && code[i+1].Op == RECV_FROM {
+					result = append(result, Instruction{Op: ASYNC_IO, Value: []interface{}{code[i].Value, code[i+1].Value}})
+					i++
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
 }
