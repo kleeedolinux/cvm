@@ -17,24 +17,32 @@ type Value interface{}
 
 type VM struct {
 	stack        []Value
+	stackMutex   sync.RWMutex
 	memory       map[int]Value
+	memoryMutex  sync.RWMutex
 	pc           int
+	pcMutex      sync.RWMutex
 	code         []Instruction
-	mutex        sync.Mutex
 	routines     map[int]*VM
+	routineMutex sync.RWMutex
 	routineID    int
 	optimizer    *Optimizer
 	channels     map[int]*Channel
+	channelMutex sync.RWMutex
 	channelID    int
 	gc           *GC
 	functions    map[string][]Instruction
+	funcMutex    sync.RWMutex
 	callStack    []int
+	callMutex    sync.RWMutex
 	errorHandler func(error)
 	stdOut       io.Writer
 	stdIn        io.Reader
 	debug        bool
 	globals      map[string]Value
+	globalMutex  sync.RWMutex
 	types        map[string]*TypeInfo
+	typeMutex    sync.RWMutex
 	memManager   *MemoryManager
 	crypto       *CryptoModule
 }
@@ -98,10 +106,14 @@ func (vm *VM) EnableDebug(enable bool) {
 }
 
 func (vm *VM) RegisterFunction(name string, code []Instruction) {
+	vm.funcMutex.Lock()
+	defer vm.funcMutex.Unlock()
 	vm.functions[name] = code
 }
 
 func (vm *VM) RegisterType(name string, properties map[string]PropertyInfo, methods map[string]MethodInfo) {
+	vm.typeMutex.Lock()
+	defer vm.typeMutex.Unlock()
 	vm.types[name] = &TypeInfo{
 		Name:       name,
 		Properties: properties,
@@ -110,16 +122,20 @@ func (vm *VM) RegisterType(name string, properties map[string]PropertyInfo, meth
 }
 
 func (vm *VM) GetGlobal(name string) Value {
+	vm.globalMutex.RLock()
+	defer vm.globalMutex.RUnlock()
 	return vm.globals[name]
 }
 
 func (vm *VM) SetGlobal(name string, value Value) {
+	vm.globalMutex.Lock()
+	defer vm.globalMutex.Unlock()
 	vm.globals[name] = value
 }
 
 func (vm *VM) Push(v Value) {
-	vm.mutex.Lock()
-	defer vm.mutex.Unlock()
+	vm.stackMutex.Lock()
+	defer vm.stackMutex.Unlock()
 	if id, ok := v.(uint64); ok {
 		vm.gc.IncrementRef(id)
 	}
@@ -127,8 +143,8 @@ func (vm *VM) Push(v Value) {
 }
 
 func (vm *VM) Pop() Value {
-	vm.mutex.Lock()
-	defer vm.mutex.Unlock()
+	vm.stackMutex.Lock()
+	defer vm.stackMutex.Unlock()
 	if len(vm.stack) == 0 {
 		return nil
 	}
@@ -141,8 +157,8 @@ func (vm *VM) Pop() Value {
 }
 
 func (vm *VM) Load(addr int) Value {
-	vm.mutex.Lock()
-	defer vm.mutex.Unlock()
+	vm.memoryMutex.RLock()
+	defer vm.memoryMutex.RUnlock()
 	v := vm.memory[addr]
 	if id, ok := v.(uint64); ok {
 		vm.gc.IncrementRef(id)
@@ -151,8 +167,8 @@ func (vm *VM) Load(addr int) Value {
 }
 
 func (vm *VM) Store(addr int, v Value) {
-	vm.mutex.Lock()
-	defer vm.mutex.Unlock()
+	vm.memoryMutex.Lock()
+	defer vm.memoryMutex.Unlock()
 	if oldID, ok := vm.memory[addr].(uint64); ok {
 		vm.gc.DecrementRef(oldID)
 	}
@@ -171,8 +187,10 @@ func (vm *VM) freeMemory(ptr uintptr) {
 }
 
 func (vm *VM) Execute(code []Instruction) error {
+	vm.pcMutex.Lock()
 	vm.code = vm.optimizer.Optimize(code)
 	vm.pc = 0
+	vm.pcMutex.Unlock()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -184,15 +202,26 @@ func (vm *VM) Execute(code []Instruction) error {
 		}
 	}()
 
-	for vm.pc < len(vm.code) {
-		if vm.debug {
-			fmt.Fprintf(vm.stdOut, "PC: %d, Instruction: %v\n", vm.pc, vm.code[vm.pc])
+	for {
+		vm.pcMutex.RLock()
+		if vm.pc >= len(vm.code) {
+			vm.pcMutex.RUnlock()
+			break
 		}
 		instr := vm.code[vm.pc]
+		vm.pcMutex.RUnlock()
+
+		if vm.debug {
+			fmt.Fprintf(vm.stdOut, "PC: %d, Instruction: %v\n", vm.pc, instr)
+		}
+
 		if err := vm.executeInstruction(instr); err != nil {
 			return err
 		}
+
+		vm.pcMutex.Lock()
 		vm.pc++
+		vm.pcMutex.Unlock()
 	}
 	return nil
 }
@@ -361,8 +390,10 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 	case SPAWN:
 		if code, ok := instr.Value.([]Instruction); ok {
 			newVM := NewVM()
+			vm.routineMutex.Lock()
 			newVM.routineID = vm.routineID + 1
 			vm.routines[newVM.routineID] = newVM
+			vm.routineMutex.Unlock()
 			go newVM.Execute(code)
 			vm.Push(newVM.routineID)
 		}
@@ -370,30 +401,42 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 		runtime.Gosched()
 	case JOIN:
 		if routineID, ok := vm.Pop().(int); ok {
+			vm.routineMutex.Lock()
 			if _, exists := vm.routines[routineID]; exists {
 				delete(vm.routines, routineID)
 			}
+			vm.routineMutex.Unlock()
 		}
 	case CHANNEL:
 		if capacity, ok := instr.Value.(int); ok {
 			ch := NewChannel(capacity)
+			vm.channelMutex.Lock()
 			vm.channelID++
 			vm.channels[vm.channelID] = ch
+			vm.channelMutex.Unlock()
 			vm.Push(vm.channelID)
 		}
 	case SEND:
 		if chID, ok := vm.Pop().(int); ok {
+			vm.channelMutex.RLock()
 			if ch, exists := vm.channels[chID]; exists {
+				vm.channelMutex.RUnlock()
 				value := vm.Pop()
 				ch.Send(value)
+			} else {
+				vm.channelMutex.RUnlock()
 			}
 		}
 	case RECV:
 		if chID, ok := vm.Pop().(int); ok {
+			vm.channelMutex.RLock()
 			if ch, exists := vm.channels[chID]; exists {
+				vm.channelMutex.RUnlock()
 				if value, ok := ch.Receive(); ok {
 					vm.Push(value)
 				}
+			} else {
+				vm.channelMutex.RUnlock()
 			}
 		}
 	case SELECT:
