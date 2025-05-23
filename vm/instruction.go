@@ -131,9 +131,213 @@ const (
 	FILE_PERM
 	FILE_OWNER
 	FILE_GROUP
+
+	// Module system
+	IMPORT
+	EXPORT
+	MODULE_GET
+	MODULE_SET
+
+	// Advanced control flow
+	DEFER
+	RECOVER
+	RANGE
+	YIELD_FROM
+	AWAIT
+
+	// Object-oriented features
+	CLASS
+	INTERFACE
+	GENERIC
+	DECORATOR
+	INHERIT
+	IMPLEMENT
+	OVERRIDE
+	SUPER
+	THIS
+
+	// Pattern matching and destructuring
+	PATTERN_MATCH
+	SPREAD
+	DESTRUCTURE
+	COMPREHENSION
+	PIPELINE
+
+	// Functional programming
+	CURRY
+	COMPOSE
+	MEMOIZE
+	LAZY
+	PARTIAL
+	APPLY
+	BIND_FN
+
+	// Reactive programming
+	STREAM
+	REACTIVE
+	OBSERVABLE
+	SUBSCRIBE
+	PUBLISH
+	FILTER
+	MAP
+	REDUCE
+
+	// Concurrency patterns
+	TRANSACTION
+	ATOMIC
+	PARALLEL
+	RACE
+	TIMEOUT
+	RETRY
+	CIRCUIT_BREAKER
+	RATE_LIMIT
+	BULKHEAD
+
+	// Caching and performance
+	CACHE
+	MEMOIZE_FN
+	LAZY_EVAL
+	PRELOAD
+	PREFETCH
+
+	// Observability
+	METRICS
+	TRACING
+	LOGGING
+	PROFILING
+	DEBUGGING
+	TELEMETRY
+	MONITORING
+	ALERTING
 )
 
 type Instruction struct {
 	Op    OpCode
 	Value interface{}
+}
+
+// Core interfaces for advanced features
+type Iterator interface {
+	HasNext() bool
+	Next() interface{}
+}
+
+type Generator struct {
+	code     []Instruction
+	pc       int
+	stack    []Value
+	locals   map[string]Value
+	finished bool
+}
+
+type Promise struct {
+	value interface{}
+	err   error
+	done  chan struct{}
+}
+
+type Pattern interface {
+	Match(value interface{}) bool
+	Extract(value interface{}) interface{}
+}
+
+type Collection interface {
+	Spread() []interface{}
+}
+
+type DestructurePattern interface {
+	Match(value interface{}) bool
+	Bind(value interface{}, vm *VM)
+}
+
+type Comprehension interface {
+	Evaluate(vm *VM) interface{}
+}
+
+type Pipeline interface {
+	Execute(vm *VM) interface{}
+}
+
+type Function interface {
+	Call(args ...interface{}) interface{}
+	Curry() Function
+	Memoize() Function
+}
+
+type Stream interface {
+	Next() (interface{}, bool)
+	Close()
+}
+
+type Reactive interface {
+	Subscribe(observer interface{})
+	Unsubscribe(observer interface{})
+	Notify(value interface{})
+}
+
+type Transaction interface {
+	Execute(vm *VM) error
+	Commit() error
+	Rollback() error
+}
+
+type Atomic interface {
+	Execute(vm *VM) error
+}
+
+type Parallel interface {
+	Execute(vm *VM) error
+}
+
+type Race interface {
+	Execute(vm *VM) error
+}
+
+type Timeout interface {
+	Execute(vm *VM) error
+}
+
+type Retry interface {
+	Execute(vm *VM) error
+}
+
+type CircuitBreaker interface {
+	Execute(vm *VM) error
+}
+
+type RateLimit interface {
+	Execute(vm *VM) error
+}
+
+type Bulkhead interface {
+	Execute(vm *VM) error
+}
+
+type Cache interface {
+	Execute(vm *VM) error
+}
+
+type Metrics interface {
+	Execute(vm *VM) error
+}
+
+type Tracing interface {
+	Execute(vm *VM) error
+}
+
+type Logging interface {
+	Execute(vm *VM) error
+}
+
+type Profiling interface {
+	Execute(vm *VM) error
+}
+
+type Debugging interface {
+	Execute(vm *VM) error
+}
+
+type Expression interface {
+	Evaluate(vm *VM) interface{}
+	Lazy() Expression
 }

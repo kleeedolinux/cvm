@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"strconv"
@@ -37,22 +38,51 @@ type VM struct {
 	types        map[string]*TypeInfo
 	memManager   *MemoryManager
 	crypto       *CryptoModule
+	modules      map[string]*Module
+	imports      map[string]bool
+	context      *Context
+	exports      map[string]bool
+	deferred     [][]Instruction
+}
+
+type Context struct {
+	Variables map[string]Value
+	Parent    *Context
+	Scope     int
+}
+
+type Module struct {
+	Name      string
+	Functions map[string][]Instruction
+	Globals   map[string]Value
+	Types     map[string]*TypeInfo
+	Imports   map[string]bool
+	Exports   map[string]bool
 }
 
 type TypeInfo struct {
 	Name       string
 	Properties map[string]PropertyInfo
 	Methods    map[string]MethodInfo
+	BaseType   string
+	Interfaces []string
+	Generics   []string
 }
 
 type PropertyInfo struct {
 	Type     string
 	ReadOnly bool
+	Default  interface{}
+	Tags     map[string]string
 }
 
 type MethodInfo struct {
 	Code       []Instruction
 	ParamCount int
+	Returns    []string
+	Variadic   bool
+	Async      bool
+	Decorators []string
 }
 
 func NewVM() *VM {
@@ -71,6 +101,11 @@ func NewVM() *VM {
 		globals:      make(map[string]Value, 64),
 		types:        make(map[string]*TypeInfo, 32),
 		memManager:   NewMemoryManager(),
+		modules:      make(map[string]*Module),
+		imports:      make(map[string]bool),
+		context:      &Context{Variables: make(map[string]Value)},
+		exports:      make(map[string]bool),
+		deferred:     make([][]Instruction, 0),
 	}
 	vm.crypto = NewCryptoModule(vm)
 	vm.crypto.RegisterFunctions()
@@ -117,13 +152,16 @@ func (vm *VM) SetGlobal(name string, value Value) {
 	vm.globals[name] = value
 }
 
-func (vm *VM) Push(v Value) {
+func (vm *VM) Push(values ...interface{}) {
 	vm.mutex.Lock()
 	defer vm.mutex.Unlock()
-	if id, ok := v.(uint64); ok {
-		vm.gc.IncrementRef(id)
+
+	for _, v := range values {
+		if id, ok := v.(uint64); ok {
+			vm.gc.IncrementRef(id)
+		}
+		vm.stack = append(vm.stack, v)
 	}
-	vm.stack = append(vm.stack, v)
 }
 
 func (vm *VM) Pop() Value {
@@ -637,6 +675,205 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 				}
 			}
 		}
+	case IMPORT:
+		if moduleName, ok := instr.Value.(string); ok {
+			if err := vm.importModule(moduleName); err != nil {
+				return err
+			}
+		}
+	case EXPORT:
+		if name, ok := instr.Value.(string); ok {
+			vm.exports[name] = true
+		}
+	case DEFER:
+		if code, ok := instr.Value.([]Instruction); ok {
+			vm.callStack = append(vm.callStack, -1)
+			vm.deferred = append(vm.deferred, code)
+		}
+	case RECOVER:
+		if err := vm.Pop(); err != nil {
+			vm.Push(err)
+		}
+	case RANGE:
+		if iter, ok := vm.Pop().(Iterator); ok {
+			if iter.HasNext() {
+				vm.Push(iter.Next())
+			} else {
+				vm.pc = instr.Value.(int) - 1
+			}
+		}
+	case YIELD_FROM:
+		if gen, ok := vm.Pop().(*Generator); ok {
+			if value, done := gen.Next(); !done {
+				vm.Push(value)
+			} else {
+				vm.pc = instr.Value.(int) - 1
+			}
+		}
+	case AWAIT:
+		if promise, ok := vm.Pop().(*Promise); ok {
+			if value, err := promise.Await(); err == nil {
+				vm.Push(value)
+			} else {
+				return err
+			}
+		}
+	case CLASS:
+		if classInfo, ok := instr.Value.(map[string]interface{}); ok {
+			vm.defineClass(classInfo)
+		}
+	case INTERFACE:
+		if interfaceInfo, ok := instr.Value.(map[string]interface{}); ok {
+			vm.defineInterface(interfaceInfo)
+		}
+	case GENERIC:
+		if genericInfo, ok := instr.Value.(map[string]interface{}); ok {
+			vm.defineGeneric(genericInfo)
+		}
+	case DECORATOR:
+		if decoratorInfo, ok := instr.Value.(map[string]interface{}); ok {
+			vm.applyDecorator(decoratorInfo)
+		}
+	case PATTERN_MATCH:
+		if pattern, ok := instr.Value.(Pattern); ok {
+			if value := vm.Pop(); pattern.Match(value) {
+				vm.Push(pattern.Extract(value))
+			} else {
+				vm.pc = instr.Value.(int) - 1
+			}
+		}
+	case SPREAD:
+		if collection, ok := vm.Pop().(Collection); ok {
+			vm.Push(collection.Spread()...)
+		}
+	case DESTRUCTURE:
+		if pattern, ok := instr.Value.(DestructurePattern); ok {
+			if value := vm.Pop(); pattern.Match(value) {
+				pattern.Bind(value, vm)
+			}
+		}
+	case COMPREHENSION:
+		if comp, ok := instr.Value.(Comprehension); ok {
+			vm.Push(comp.Evaluate(vm))
+		}
+	case PIPELINE:
+		if pipeline, ok := instr.Value.(Pipeline); ok {
+			vm.Push(pipeline.Execute(vm))
+		}
+	case CURRY:
+		if fn, ok := vm.Pop().(Function); ok {
+			vm.Push(fn.Curry())
+		}
+	case COMPOSE:
+		if fns, ok := vm.Pop().([]Function); ok {
+			vm.Push(Compose(fns...))
+		}
+	case MEMOIZE:
+		if fn, ok := vm.Pop().(Function); ok {
+			vm.Push(fn.Memoize())
+		}
+	case LAZY:
+		if expr, ok := instr.Value.(Expression); ok {
+			vm.Push(expr.Lazy())
+		}
+	case STREAM:
+		if stream, ok := instr.Value.(Stream); ok {
+			vm.Push(stream)
+		}
+	case REACTIVE:
+		if reactive, ok := instr.Value.(Reactive); ok {
+			vm.Push(reactive)
+		}
+	case TRANSACTION:
+		if tx, ok := instr.Value.(Transaction); ok {
+			if err := tx.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case ATOMIC:
+		if atomic, ok := instr.Value.(Atomic); ok {
+			if err := atomic.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case PARALLEL:
+		if parallel, ok := instr.Value.(Parallel); ok {
+			if err := parallel.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case RACE:
+		if race, ok := instr.Value.(Race); ok {
+			if err := race.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case TIMEOUT:
+		if timeout, ok := instr.Value.(Timeout); ok {
+			if err := timeout.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case RETRY:
+		if retry, ok := instr.Value.(Retry); ok {
+			if err := retry.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case CIRCUIT_BREAKER:
+		if cb, ok := instr.Value.(CircuitBreaker); ok {
+			if err := cb.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case RATE_LIMIT:
+		if rl, ok := instr.Value.(RateLimit); ok {
+			if err := rl.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case BULKHEAD:
+		if bh, ok := instr.Value.(Bulkhead); ok {
+			if err := bh.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case CACHE:
+		if cache, ok := instr.Value.(Cache); ok {
+			if err := cache.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case METRICS:
+		if metrics, ok := instr.Value.(Metrics); ok {
+			if err := metrics.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case TRACING:
+		if tracing, ok := instr.Value.(Tracing); ok {
+			if err := tracing.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case LOGGING:
+		if logging, ok := instr.Value.(Logging); ok {
+			if err := logging.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case PROFILING:
+		if profiling, ok := instr.Value.(Profiling); ok {
+			if err := profiling.Execute(vm); err != nil {
+				return err
+			}
+		}
+	case DEBUGGING:
+		if debugging, ok := instr.Value.(Debugging); ok {
+			if err := debugging.Execute(vm); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -819,47 +1056,518 @@ func parseValue(valueStr string) (interface{}, error) {
 }
 
 var opCodes = map[string]OpCode{
-	"PUSH":           PUSH,
-	"POP":            POP,
-	"ADD":            ADD,
-	"SUB":            SUB,
-	"MUL":            MUL,
-	"DIV":            DIV,
-	"MOD":            MOD,
-	"LOAD":           LOAD,
-	"STORE":          STORE,
-	"JMP":            JMP,
-	"JMPIF":          JMPIF,
-	"JMPIFNOT":       JMPIFNOT,
-	"CALL":           CALL,
-	"RET":            RET,
-	"SPAWN":          SPAWN,
-	"YIELD":          YIELD,
-	"JOIN":           JOIN,
-	"CHANNEL":        CHANNEL,
-	"SEND":           SEND,
-	"RECV":           RECV,
-	"SELECT":         SELECT,
-	"TIMER":          TIMER,
-	"LIST":           LIST,
-	"DICT":           DICT,
-	"STRUCT":         STRUCT,
-	"STRING":         STRING,
-	"APPEND":         APPEND,
-	"SET":            SET,
-	"FIELD":          FIELD,
-	"PERSIST":        PERSIST,
-	"LOAD_PERSISTED": LOAD_PERSISTED,
-	"PRINT":          PRINT,
-	"READ":           READ,
-	"GLOBAL_GET":     GLOBAL_GET,
-	"GLOBAL_SET":     GLOBAL_SET,
-	"NEW_OBJECT":     NEW_OBJECT,
-	"METHOD_CALL":    METHOD_CALL,
-	"TRY":            TRY,
-	"THROW":          THROW,
-	"FILE_OPEN":      FILE_OPEN,
-	"FILE_CLOSE":     FILE_CLOSE,
-	"FILE_READ":      FILE_READ,
-	"FILE_WRITE":     FILE_WRITE,
+	"PUSH":            PUSH,
+	"POP":             POP,
+	"ADD":             ADD,
+	"SUB":             SUB,
+	"MUL":             MUL,
+	"DIV":             DIV,
+	"MOD":             MOD,
+	"LOAD":            LOAD,
+	"STORE":           STORE,
+	"JMP":             JMP,
+	"JMPIF":           JMPIF,
+	"JMPIFNOT":        JMPIFNOT,
+	"CALL":            CALL,
+	"RET":             RET,
+	"SPAWN":           SPAWN,
+	"YIELD":           YIELD,
+	"JOIN":            JOIN,
+	"CHANNEL":         CHANNEL,
+	"SEND":            SEND,
+	"RECV":            RECV,
+	"SELECT":          SELECT,
+	"TIMER":           TIMER,
+	"LIST":            LIST,
+	"DICT":            DICT,
+	"STRUCT":          STRUCT,
+	"STRING":          STRING,
+	"APPEND":          APPEND,
+	"SET":             SET,
+	"FIELD":           FIELD,
+	"PERSIST":         PERSIST,
+	"LOAD_PERSISTED":  LOAD_PERSISTED,
+	"PRINT":           PRINT,
+	"READ":            READ,
+	"GLOBAL_GET":      GLOBAL_GET,
+	"GLOBAL_SET":      GLOBAL_SET,
+	"NEW_OBJECT":      NEW_OBJECT,
+	"METHOD_CALL":     METHOD_CALL,
+	"TRY":             TRY,
+	"THROW":           THROW,
+	"FILE_OPEN":       FILE_OPEN,
+	"FILE_CLOSE":      FILE_CLOSE,
+	"FILE_READ":       FILE_READ,
+	"FILE_WRITE":      FILE_WRITE,
+	"IMPORT":          IMPORT,
+	"EXPORT":          EXPORT,
+	"DEFER":           DEFER,
+	"RECOVER":         RECOVER,
+	"RANGE":           RANGE,
+	"YIELD_FROM":      YIELD_FROM,
+	"AWAIT":           AWAIT,
+	"CLASS":           CLASS,
+	"INTERFACE":       INTERFACE,
+	"GENERIC":         GENERIC,
+	"DECORATOR":       DECORATOR,
+	"PATTERN_MATCH":   PATTERN_MATCH,
+	"SPREAD":          SPREAD,
+	"DESTRUCTURE":     DESTRUCTURE,
+	"COMPREHENSION":   COMPREHENSION,
+	"PIPELINE":        PIPELINE,
+	"CURRY":           CURRY,
+	"COMPOSE":         COMPOSE,
+	"MEMOIZE":         MEMOIZE,
+	"LAZY":            LAZY,
+	"STREAM":          STREAM,
+	"REACTIVE":        REACTIVE,
+	"TRANSACTION":     TRANSACTION,
+	"ATOMIC":          ATOMIC,
+	"PARALLEL":        PARALLEL,
+	"RACE":            RACE,
+	"TIMEOUT":         TIMEOUT,
+	"RETRY":           RETRY,
+	"CIRCUIT_BREAKER": CIRCUIT_BREAKER,
+	"RATE_LIMIT":      RATE_LIMIT,
+	"BULKHEAD":        BULKHEAD,
+	"CACHE":           CACHE,
+	"METRICS":         METRICS,
+	"TRACING":         TRACING,
+	"LOGGING":         LOGGING,
+	"PROFILING":       PROFILING,
+	"DEBUGGING":       DEBUGGING,
+}
+
+func (vm *VM) importModule(name string) error {
+	if _, exists := vm.imports[name]; exists {
+		return nil
+	}
+
+	module, err := vm.loadModule(name)
+	if err != nil {
+		return err
+	}
+
+	vm.modules[name] = module
+	vm.imports[name] = true
+	return nil
+}
+
+func (vm *VM) loadModule(name string) (*Module, error) {
+	// Check if module is already loaded
+	if module, exists := vm.modules[name]; exists {
+		return module, nil
+	}
+
+	// Create new module
+	module := &Module{
+		Name:      name,
+		Functions: make(map[string][]Instruction),
+		Globals:   make(map[string]Value),
+		Types:     make(map[string]*TypeInfo),
+		Imports:   make(map[string]bool),
+		Exports:   make(map[string]bool),
+	}
+
+	// Try to load from disk first
+	modulePath := fmt.Sprintf("./modules/%s.cvm", name)
+	if _, err := os.Stat(modulePath); err == nil {
+		// Read module file
+		content, err := os.ReadFile(modulePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read module file: %v", err)
+		}
+
+		// Parse module content
+		instructions, err := vm.Parse(string(content))
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse module: %v", err)
+		}
+
+		// Execute module initialization
+		if err := vm.executeModule(module, instructions); err != nil {
+			return nil, fmt.Errorf("failed to initialize module: %v", err)
+		}
+
+		return module, nil
+	}
+
+	// Try to load from network if not found on disk
+	moduleURL := fmt.Sprintf("https://modules.cvm.io/%s", name)
+	resp, err := http.Get(moduleURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch module from network: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("module not found on network: %s", name)
+	}
+
+	// Read module content
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read module content: %v", err)
+	}
+
+	// Parse module content
+	instructions, err := vm.Parse(string(content))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse module: %v", err)
+	}
+
+	// Execute module initialization
+	if err := vm.executeModule(module, instructions); err != nil {
+		return nil, fmt.Errorf("failed to initialize module: %v", err)
+	}
+
+	// Cache module locally
+	if err := os.MkdirAll("./modules", 0755); err != nil {
+		return nil, fmt.Errorf("failed to create modules directory: %v", err)
+	}
+
+	if err := os.WriteFile(modulePath, content, 0644); err != nil {
+		return nil, fmt.Errorf("failed to cache module: %v", err)
+	}
+
+	return module, nil
+}
+
+func (vm *VM) executeModule(module *Module, instructions []Instruction) error {
+	// Save current VM state
+	savedStack := vm.stack
+	savedPC := vm.pc
+	savedCode := vm.code
+	savedGlobals := vm.globals
+	savedTypes := vm.types
+
+	// Set up module execution environment
+	vm.stack = make([]Value, 0, 4096)
+	vm.pc = 0
+	vm.code = instructions
+	vm.globals = module.Globals
+	vm.types = module.Types
+
+	// Execute module code
+	err := vm.Execute(instructions)
+
+	// Restore VM state
+	vm.stack = savedStack
+	vm.pc = savedPC
+	vm.code = savedCode
+	vm.globals = savedGlobals
+	vm.types = savedTypes
+
+	if err != nil {
+		return fmt.Errorf("module execution failed: %v", err)
+	}
+
+	// Copy exported functions and types
+	for name, fn := range vm.functions {
+		if module.Exports[name] {
+			module.Functions[name] = fn
+		}
+	}
+
+	return nil
+}
+
+func (vm *VM) defineClass(info map[string]interface{}) {
+	name := info["name"].(string)
+	baseType := info["baseType"].(string)
+	interfaces := info["interfaces"].([]string)
+	generics := info["generics"].([]string)
+
+	vm.types[name] = &TypeInfo{
+		Name:       name,
+		BaseType:   baseType,
+		Interfaces: interfaces,
+		Generics:   generics,
+		Properties: make(map[string]PropertyInfo),
+		Methods:    make(map[string]MethodInfo),
+	}
+}
+
+func (vm *VM) defineInterface(info map[string]interface{}) {
+	name := info["name"].(string)
+	methods := info["methods"].(map[string]MethodInfo)
+
+	vm.types[name] = &TypeInfo{
+		Name:       name,
+		Methods:    methods,
+		Properties: make(map[string]PropertyInfo),
+	}
+}
+
+func (vm *VM) defineGeneric(info map[string]interface{}) {
+	name := info["name"].(string)
+	constraints := info["constraints"].([]string)
+
+	vm.types[name] = &TypeInfo{
+		Name:       name,
+		Generics:   constraints,
+		Properties: make(map[string]PropertyInfo),
+		Methods:    make(map[string]MethodInfo),
+	}
+}
+
+func (vm *VM) applyDecorator(info map[string]interface{}) {
+	target := info["target"].(string)
+	decorator := info["decorator"].(string)
+	args := info["args"].([]interface{})
+
+	if fn, exists := vm.functions[target]; exists {
+		vm.functions[target] = vm.decorateFunction(fn, decorator, args)
+	}
+}
+
+func (vm *VM) decorateFunction(fn []Instruction, decorator string, args []interface{}) []Instruction {
+	// Create wrapper instructions for the decorator
+	wrapper := make([]Instruction, 0)
+
+	// Push decorator arguments
+	for _, arg := range args {
+		wrapper = append(wrapper, Instruction{Op: PUSH, Value: arg})
+	}
+
+	// Push the original function
+	wrapper = append(wrapper, Instruction{Op: PUSH, Value: fn})
+
+	// Add decorator-specific instructions
+	switch decorator {
+	case "memoize":
+		// Add memoization wrapper
+		wrapper = append(wrapper, []Instruction{
+			{Op: PUSH, Value: make(map[interface{}]interface{})}, // Cache map
+			{Op: PUSH, Value: fn},                                // Original function
+			{Op: PUSH, Value: "memoize_wrapper"},                 // Wrapper name
+			{Op: CALL, Value: "memoize_wrapper"},                 // Call wrapper
+		}...)
+
+	case "timing":
+		// Add timing wrapper
+		wrapper = append(wrapper, []Instruction{
+			{Op: PUSH, Value: "start_time"},     // Start time label
+			{Op: CALL, Value: "time_now"},       // Get current time
+			{Op: PUSH, Value: fn},               // Original function
+			{Op: PUSH, Value: "timing_wrapper"}, // Wrapper name
+			{Op: CALL, Value: "timing_wrapper"}, // Call wrapper
+		}...)
+
+	case "retry":
+		// Add retry wrapper
+		maxRetries := 3
+		if len(args) > 0 {
+			if retries, ok := args[0].(int); ok {
+				maxRetries = retries
+			}
+		}
+		wrapper = append(wrapper, []Instruction{
+			{Op: PUSH, Value: maxRetries},      // Max retries
+			{Op: PUSH, Value: fn},              // Original function
+			{Op: PUSH, Value: "retry_wrapper"}, // Wrapper name
+			{Op: CALL, Value: "retry_wrapper"}, // Call wrapper
+		}...)
+
+	case "logging":
+		// Add logging wrapper
+		wrapper = append(wrapper, []Instruction{
+			{Op: PUSH, Value: fn},                // Original function
+			{Op: PUSH, Value: "logging_wrapper"}, // Wrapper name
+			{Op: CALL, Value: "logging_wrapper"}, // Call wrapper
+		}...)
+
+	case "validation":
+		// Add validation wrapper
+		if len(args) > 0 {
+			validator := args[0]
+			wrapper = append(wrapper, []Instruction{
+				{Op: PUSH, Value: validator},            // Validator function
+				{Op: PUSH, Value: fn},                   // Original function
+				{Op: PUSH, Value: "validation_wrapper"}, // Wrapper name
+				{Op: CALL, Value: "validation_wrapper"}, // Call wrapper
+			}...)
+		}
+
+	case "caching":
+		// Add caching wrapper
+		ttl := 3600 // Default TTL in seconds
+		if len(args) > 0 {
+			if cacheTTL, ok := args[0].(int); ok {
+				ttl = cacheTTL
+			}
+		}
+		wrapper = append(wrapper, []Instruction{
+			{Op: PUSH, Value: ttl},               // Cache TTL
+			{Op: PUSH, Value: fn},                // Original function
+			{Op: PUSH, Value: "caching_wrapper"}, // Wrapper name
+			{Op: CALL, Value: "caching_wrapper"}, // Call wrapper
+		}...)
+
+	default:
+		// For unknown decorators, just return the original function
+		return fn
+	}
+
+	// Add return instruction
+	wrapper = append(wrapper, Instruction{Op: RET, Value: nil})
+
+	return wrapper
+}
+
+func (g *Generator) Next() (interface{}, bool) {
+	if g.finished {
+		return nil, true
+	}
+
+	// Execute until we hit a YIELD instruction or finish
+	for g.pc < len(g.code) {
+		instr := g.code[g.pc]
+		g.pc++
+
+		switch instr.Op {
+		case YIELD:
+			// Return the yielded value
+			if len(g.stack) > 0 {
+				value := g.stack[len(g.stack)-1]
+				g.stack = g.stack[:len(g.stack)-1]
+				return value, false
+			}
+			return nil, false
+
+		case YIELD_FROM:
+			// Handle nested generators
+			if gen, ok := instr.Value.(*Generator); ok {
+				if value, done := gen.Next(); !done {
+					return value, false
+				}
+			}
+
+		case RET:
+			// Generator finished
+			g.finished = true
+			if len(g.stack) > 0 {
+				value := g.stack[len(g.stack)-1]
+				g.stack = g.stack[:len(g.stack)-1]
+				return value, true
+			}
+			return nil, true
+
+		case PUSH:
+			g.stack = append(g.stack, instr.Value)
+
+		case POP:
+			if len(g.stack) > 0 {
+				g.stack = g.stack[:len(g.stack)-1]
+			}
+
+		case LOAD:
+			if name, ok := instr.Value.(string); ok {
+				if value, exists := g.locals[name]; exists {
+					g.stack = append(g.stack, value)
+				}
+			}
+
+		case STORE:
+			if name, ok := instr.Value.(string); ok {
+				if len(g.stack) > 0 {
+					g.locals[name] = g.stack[len(g.stack)-1]
+					g.stack = g.stack[:len(g.stack)-1]
+				}
+			}
+
+		case CALL:
+			if name, ok := instr.Value.(string); ok {
+				// Handle built-in functions
+				switch name {
+				case "range":
+					if len(g.stack) >= 2 {
+						end := g.stack[len(g.stack)-1].(int)
+						start := g.stack[len(g.stack)-2].(int)
+						g.stack = g.stack[:len(g.stack)-2]
+						if start < end {
+							g.stack = append(g.stack, start+1)
+							return start, false
+						}
+						g.finished = true
+						return nil, true
+					}
+				case "enumerate":
+					if len(g.stack) > 0 {
+						iter := g.stack[len(g.stack)-1]
+						g.stack = g.stack[:len(g.stack)-1]
+						if iterator, ok := iter.(Iterator); ok {
+							if iterator.HasNext() {
+								value := iterator.Next()
+								g.stack = append(g.stack, value)
+								return value, false
+							}
+						}
+						g.finished = true
+						return nil, true
+					}
+				}
+			}
+
+		case JMP:
+			if addr, ok := instr.Value.(int); ok {
+				g.pc = addr
+			}
+
+		case JMPIF:
+			if addr, ok := instr.Value.(int); ok {
+				if len(g.stack) > 0 {
+					cond := g.stack[len(g.stack)-1]
+					g.stack = g.stack[:len(g.stack)-1]
+					if cond != nil && cond != false {
+						g.pc = addr
+					}
+				}
+			}
+
+		case JMPIFNOT:
+			if addr, ok := instr.Value.(int); ok {
+				if len(g.stack) > 0 {
+					cond := g.stack[len(g.stack)-1]
+					g.stack = g.stack[:len(g.stack)-1]
+					if cond == nil || cond == false {
+						g.pc = addr
+					}
+				}
+			}
+		}
+	}
+
+	// If we get here, the generator is finished
+	g.finished = true
+	return nil, true
+}
+
+func (p *Promise) Await() (interface{}, error) {
+	<-p.done
+	return p.value, p.err
+}
+
+func Compose(fns ...Function) Function {
+	return &composedFunction{functions: fns}
+}
+
+type composedFunction struct {
+	functions []Function
+}
+
+func (cf *composedFunction) Call(args ...interface{}) interface{} {
+	result := args[0]
+	for _, fn := range cf.functions {
+		result = fn.Call(result)
+	}
+	return result
+}
+
+func (cf *composedFunction) Curry() Function {
+	return cf
+}
+
+func (cf *composedFunction) Memoize() Function {
+	return cf
 }
