@@ -21,6 +21,13 @@ const (
 	TypeRoutine
 )
 
+type Generation int
+
+const (
+	Young Generation = iota
+	Old
+)
+
 type Object struct {
 	Type      ObjectType
 	Value     interface{}
@@ -28,6 +35,8 @@ type Object struct {
 	LastUsed  time.Time
 	Persisted bool
 	Metadata  map[string]interface{}
+	Gen       Generation
+	Age       int
 }
 
 type GC struct {
@@ -38,6 +47,9 @@ type GC struct {
 	threshold   int
 	interval    time.Duration
 	memManager  *MemoryManager
+	youngGen    []uint64
+	oldGen      []uint64
+	maxAge      int
 }
 
 func NewGC(persistPath string) *GC {
@@ -47,6 +59,9 @@ func NewGC(persistPath string) *GC {
 		threshold:   1000,
 		interval:    time.Minute * 5,
 		memManager:  NewMemoryManager(),
+		youngGen:    make([]uint64, 0, 1024),
+		oldGen:      make([]uint64, 0, 1024),
+		maxAge:      3,
 	}
 	go gc.startBackgroundGC()
 	return gc
@@ -66,9 +81,12 @@ func (gc *GC) Allocate(objType ObjectType, value interface{}) uint64 {
 		LastUsed:  time.Now(),
 		Persisted: false,
 		Metadata:  make(map[string]interface{}),
+		Gen:       Young,
+		Age:       0,
 	}
 
 	gc.objects[id] = obj
+	gc.youngGen = append(gc.youngGen, id)
 	return id
 }
 
@@ -89,7 +107,69 @@ func (gc *GC) DecrementRef(id uint64) {
 	if obj, exists := gc.objects[id]; exists {
 		obj.RefCount--
 		if obj.RefCount <= 0 {
+			if obj.Gen == Young {
+				gc.removeFromGen(gc.youngGen, id)
+			} else {
+				gc.removeFromGen(gc.oldGen, id)
+			}
 			delete(gc.objects, id)
+		}
+	}
+}
+
+func (gc *GC) removeFromGen(gen []uint64, id uint64) {
+	for i, objID := range gen {
+		if objID == id {
+			gen[i] = gen[len(gen)-1]
+			gen = gen[:len(gen)-1]
+			break
+		}
+	}
+}
+
+func (gc *GC) promoteObject(id uint64) {
+	obj := gc.objects[id]
+	obj.Gen = Old
+	gc.removeFromGen(gc.youngGen, id)
+	gc.oldGen = append(gc.oldGen, id)
+}
+
+func (gc *GC) collectYoungGen() {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+
+	for _, id := range gc.youngGen {
+		obj := gc.objects[id]
+		if obj.RefCount <= 0 {
+			delete(gc.objects, id)
+		} else {
+			obj.Age++
+			if obj.Age >= gc.maxAge {
+				gc.promoteObject(id)
+			}
+		}
+	}
+}
+
+func (gc *GC) collectOldGen() {
+	gc.mutex.Lock()
+	defer gc.mutex.Unlock()
+
+	for _, id := range gc.oldGen {
+		obj := gc.objects[id]
+		if obj.RefCount <= 0 {
+			delete(gc.objects, id)
+			gc.removeFromGen(gc.oldGen, id)
+		}
+	}
+}
+
+func (gc *GC) startBackgroundGC() {
+	ticker := time.NewTicker(gc.interval)
+	for range ticker.C {
+		gc.collectYoungGen()
+		if len(gc.objects) > gc.threshold {
+			gc.collectOldGen()
 		}
 	}
 }
@@ -147,27 +227,6 @@ func (gc *GC) Load(id uint64) error {
 
 	gc.objects[id] = &obj
 	return nil
-}
-
-func (gc *GC) startBackgroundGC() {
-	ticker := time.NewTicker(gc.interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		gc.collect()
-	}
-}
-
-func (gc *GC) collect() {
-	gc.mutex.Lock()
-	defer gc.mutex.Unlock()
-
-	now := time.Now()
-	for id, obj := range gc.objects {
-		if obj.RefCount <= 0 || (now.Sub(obj.LastUsed) > gc.interval && !obj.Persisted) {
-			delete(gc.objects, id)
-		}
-	}
 }
 
 func (gc *GC) CreateList() uint64 {

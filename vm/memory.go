@@ -30,6 +30,7 @@ type MemoryPool struct {
 	mutex     sync.RWMutex
 	pageCount int
 	ioPools   map[int]*MemoryPool
+	objPool   *sync.Pool
 }
 
 type MemoryManager struct {
@@ -95,9 +96,28 @@ func (mm *MemoryManager) getOrCreatePool(size uintptr) *MemoryPool {
 		blocks:    make([]*MemoryBlock, 0),
 		pageCount: 1,
 		ioPools:   make(map[int]*MemoryPool),
+		objPool: &sync.Pool{
+			New: func() interface{} {
+				return &MemoryBlock{
+					used:     false,
+					refCount: 0,
+					ioBuffer: make([]byte, IOBufferSize),
+				}
+			},
+		},
 	}
 	mm.pools[size] = pool
 	return pool
+}
+
+func (mp *MemoryPool) getBlock() *MemoryBlock {
+	return mp.objPool.Get().(*MemoryBlock)
+}
+
+func (mp *MemoryPool) putBlock(block *MemoryBlock) {
+	block.used = false
+	block.refCount = 0
+	mp.objPool.Put(block)
 }
 
 func (mp *MemoryPool) allocateBlock(size uintptr) *MemoryBlock {
@@ -112,15 +132,14 @@ func (mp *MemoryPool) allocateBlock(size uintptr) *MemoryBlock {
 		}
 	}
 
-	newBlock := &MemoryBlock{
-		start:    uintptr(unsafe.Pointer(&make([]byte, size)[0])),
-		size:     size,
-		used:     true,
-		refCount: 1,
-	}
+	block := mp.getBlock()
+	block.start = uintptr(unsafe.Pointer(&make([]byte, size)[0]))
+	block.size = size
+	block.used = true
+	block.refCount = 1
 
-	mp.blocks = append(mp.blocks, newBlock)
-	return newBlock
+	mp.blocks = append(mp.blocks, block)
+	return block
 }
 
 func (mp *MemoryPool) freeBlock(block *MemoryBlock) {
@@ -129,7 +148,7 @@ func (mp *MemoryPool) freeBlock(block *MemoryBlock) {
 
 	block.refCount--
 	if block.refCount <= 0 {
-		block.used = false
+		mp.putBlock(block)
 		mp.defragment()
 	}
 }

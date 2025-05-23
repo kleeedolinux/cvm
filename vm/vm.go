@@ -57,19 +57,19 @@ type MethodInfo struct {
 
 func NewVM() *VM {
 	vm := &VM{
-		stack:        make([]Value, 0, 1024),
-		memory:       make(map[int]Value),
-		routines:     make(map[int]*VM),
-		channels:     make(map[int]*Channel),
+		stack:        make([]Value, 0, 4096),
+		memory:       make(map[int]Value, 1024),
+		routines:     make(map[int]*VM, 32),
+		channels:     make(map[int]*Channel, 32),
 		optimizer:    NewOptimizer(1000),
 		gc:           NewGC("./persist"),
-		functions:    make(map[string][]Instruction),
-		callStack:    make([]int, 0, 64),
+		functions:    make(map[string][]Instruction, 64),
+		callStack:    make([]int, 0, 128),
 		errorHandler: defaultErrorHandler,
 		stdOut:       os.Stdout,
 		stdIn:        os.Stdin,
-		globals:      make(map[string]Value),
-		types:        make(map[string]*TypeInfo),
+		globals:      make(map[string]Value, 64),
+		types:        make(map[string]*TypeInfo, 32),
 		memManager:   NewMemoryManager(),
 	}
 	vm.crypto = NewCryptoModule(vm)
@@ -203,13 +203,18 @@ func (vm *VM) handleError(err error) {
 	}
 }
 
-func (vm *VM) executeInstruction(instr Instruction) error {
-	switch instr.Op {
-	case PUSH:
+type instructionHandler func(*VM, Instruction) error
+
+var instructionHandlers = map[OpCode]instructionHandler{
+	PUSH: func(vm *VM, instr Instruction) error {
 		vm.Push(instr.Value)
-	case POP:
+		return nil
+	},
+	POP: func(vm *VM, instr Instruction) error {
 		vm.Pop()
-	case ADD:
+		return nil
+	},
+	ADD: func(vm *VM, instr Instruction) error {
 		b := vm.Pop()
 		a := vm.Pop()
 		if aInt, ok := a.(int); ok {
@@ -228,7 +233,9 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 				}
 			}
 		}
-	case SUB:
+		return nil
+	},
+	SUB: func(vm *VM, instr Instruction) error {
 		b := vm.Pop()
 		a := vm.Pop()
 		if aInt, ok := a.(int); ok {
@@ -236,7 +243,9 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 				vm.Push(aInt - bInt)
 			}
 		}
-	case MUL:
+		return nil
+	},
+	MUL: func(vm *VM, instr Instruction) error {
 		b := vm.Pop()
 		a := vm.Pop()
 		if aInt, ok := a.(int); ok {
@@ -244,7 +253,9 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 				vm.Push(aInt * bInt)
 			}
 		}
-	case DIV:
+		return nil
+	},
+	DIV: func(vm *VM, instr Instruction) error {
 		b := vm.Pop()
 		a := vm.Pop()
 		if aInt, ok := a.(int); ok {
@@ -255,7 +266,9 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 				vm.Push(aInt / bInt)
 			}
 		}
-	case MOD:
+		return nil
+	},
+	MOD: func(vm *VM, instr Instruction) error {
 		b := vm.Pop()
 		a := vm.Pop()
 		if aInt, ok := a.(int); ok {
@@ -266,31 +279,51 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 				vm.Push(aInt % bInt)
 			}
 		}
-	case LOAD:
+		return nil
+	},
+	LOAD: func(vm *VM, instr Instruction) error {
 		if addr, ok := instr.Value.(int); ok {
 			vm.Push(vm.Load(addr))
 		}
-	case STORE:
+		return nil
+	},
+	STORE: func(vm *VM, instr Instruction) error {
 		if addr, ok := instr.Value.(int); ok {
 			v := vm.Pop()
 			vm.Store(addr, v)
 		}
-	case JMP:
+		return nil
+	},
+	JMP: func(vm *VM, instr Instruction) error {
 		if addr, ok := instr.Value.(int); ok {
 			vm.pc = addr - 1
 		}
-	case JMPIF:
+		return nil
+	},
+	JMPIF: func(vm *VM, instr Instruction) error {
 		if addr, ok := instr.Value.(int); ok {
 			if cond := vm.Pop(); cond != nil && cond != false {
 				vm.pc = addr - 1
 			}
 		}
-	case JMPIFNOT:
+		return nil
+	},
+	JMPIFNOT: func(vm *VM, instr Instruction) error {
 		if addr, ok := instr.Value.(int); ok {
 			if cond := vm.Pop(); cond == nil || cond == false {
 				vm.pc = addr - 1
 			}
 		}
+		return nil
+	},
+}
+
+func (vm *VM) executeInstruction(instr Instruction) error {
+	if handler, ok := instructionHandlers[instr.Op]; ok {
+		return handler(vm, instr)
+	}
+
+	switch instr.Op {
 	case CALL:
 		if name, ok := instr.Value.(string); ok {
 			switch name {
@@ -485,20 +518,13 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 			methodName := methodData["name"].(string)
 			typeInfo := vm.types[methodData["type"].(string)]
 			if method, exists := typeInfo.Methods[methodName]; exists {
-				// Save current state
 				savedPC := vm.pc
 				savedCode := vm.code
-
-				// Execute method
 				vm.callStack = append(vm.callStack, savedPC)
 				vm.code = method.Code
-				vm.pc = -1 // Will be incremented to 0 in main loop
-
-				// Push object as 'this'
+				vm.pc = -1
 				vm.Push(objID)
-
 				defer func() {
-					// Restore state after method execution
 					vm.pc = vm.callStack[len(vm.callStack)-1]
 					vm.callStack = vm.callStack[:len(vm.callStack)-1]
 					vm.code = savedCode
@@ -509,7 +535,6 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 		if handlerAddr, ok := instr.Value.(int); ok {
 			defer func() {
 				if r := recover(); r != nil {
-					// Jump to handler on error
 					vm.pc = handlerAddr - 1
 					if err, ok := r.(error); ok {
 						errStrID := vm.gc.CreateString(err.Error())
@@ -555,11 +580,8 @@ func (vm *VM) executeInstruction(instr Instruction) error {
 						return err
 					}
 
-					// Store file in globals with unique ID
 					fileID := fmt.Sprintf("__file_%p", file)
 					vm.globals[fileID] = file
-
-					// Return file ID to stack
 					idStrID := vm.gc.CreateString(fileID)
 					vm.Push(idStrID)
 				}

@@ -31,6 +31,9 @@ func (o *Optimizer) Optimize(code []Instruction) []Instruction {
 	optimized = o.optimizePeephole(optimized)
 	optimized = o.optimizeIOOperations(optimized)
 	optimized = o.optimizeNetworkOperations(optimized)
+	optimized = o.optimizeStackOperations(optimized)
+	optimized = o.optimizeControlFlow(optimized)
+	optimized = o.optimizeMemoryAccess(optimized)
 
 	o.mutex.Lock()
 	if len(o.cache) >= o.maxCache {
@@ -211,6 +214,98 @@ func (o *Optimizer) optimizeNetworkOperations(code []Instruction) []Instruction 
 					result = append(result, Instruction{Op: ASYNC_IO, Value: []interface{}{code[i].Value, code[i+1].Value}})
 					i++
 					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeStackOperations(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+1 < len(code) {
+			switch code[i].Op {
+			case PUSH:
+				if code[i+1].Op == POP {
+					i++
+					continue
+				}
+			case DUP:
+				if code[i+1].Op == POP {
+					i++
+					continue
+				}
+			case SWAP:
+				if code[i+1].Op == SWAP {
+					i++
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeControlFlow(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+2 < len(code) {
+			switch code[i].Op {
+			case JMP:
+				if code[i+1].Op == JMP {
+					result = append(result, code[i+1])
+					i++
+					continue
+				}
+			case JMPIF:
+				if code[i+1].Op == JMPIFNOT {
+					if addr1, ok1 := code[i].Value.(int); ok1 {
+						if addr2, ok2 := code[i+1].Value.(int); ok2 {
+							if addr1 == addr2 {
+								result = append(result, code[i+2])
+								i += 2
+								continue
+							}
+						}
+					}
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeMemoryAccess(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+1 < len(code) {
+			switch code[i].Op {
+			case LOAD:
+				if code[i+1].Op == STORE {
+					if addr1, ok1 := code[i].Value.(int); ok1 {
+						if addr2, ok2 := code[i+1].Value.(int); ok2 {
+							if addr1 == addr2 {
+								i++
+								continue
+							}
+						}
+					}
+				}
+			case STORE:
+				if code[i+1].Op == LOAD {
+					if addr1, ok1 := code[i].Value.(int); ok1 {
+						if addr2, ok2 := code[i+1].Value.(int); ok2 {
+							if addr1 == addr2 {
+								result = append(result, code[i])
+								i++
+								continue
+							}
+						}
+					}
 				}
 			}
 		}
