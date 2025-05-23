@@ -1,20 +1,73 @@
 package vm
 
 import (
+	"runtime"
 	"strconv"
 	"sync"
 )
 
+type Platform int
+
+const (
+	PlatformGeneric Platform = iota
+	PlatformX86
+	PlatformARM
+	PlatformARM64
+	PlatformWASM
+)
+
 type Optimizer struct {
-	cache    map[string][]Instruction
-	mutex    sync.RWMutex
-	maxCache int
+	cache     map[string][]Instruction
+	mutex     sync.RWMutex
+	maxCache  int
+	platform  Platform
+	wordSize  int
+	alignment int
 }
 
 func NewOptimizer(maxCache int) *Optimizer {
+	platform := getPlatform()
+	wordSize := getWordSize()
+	alignment := getAlignment()
+
 	return &Optimizer{
-		cache:    make(map[string][]Instruction),
-		maxCache: maxCache,
+		cache:     make(map[string][]Instruction),
+		maxCache:  maxCache,
+		platform:  platform,
+		wordSize:  wordSize,
+		alignment: alignment,
+	}
+}
+
+func getPlatform() Platform {
+	switch runtime.GOARCH {
+	case "amd64":
+		return PlatformX86
+	case "arm":
+		return PlatformARM
+	case "arm64":
+		return PlatformARM64
+	case "wasm":
+		return PlatformWASM
+	default:
+		return PlatformGeneric
+	}
+}
+
+func getWordSize() int {
+	return 32 << (^uint(0) >> 63)
+}
+
+func getAlignment() int {
+	switch runtime.GOARCH {
+	case "amd64", "arm64":
+		return 8
+	case "arm":
+		return 4
+	case "wasm":
+		return 4
+	default:
+		return 8
 	}
 }
 
@@ -34,6 +87,7 @@ func (o *Optimizer) Optimize(code []Instruction) []Instruction {
 	optimized = o.optimizeStackOperations(optimized)
 	optimized = o.optimizeControlFlow(optimized)
 	optimized = o.optimizeMemoryAccess(optimized)
+	optimized = o.optimizePlatformSpecific(optimized)
 
 	o.mutex.Lock()
 	if len(o.cache) >= o.maxCache {
@@ -43,6 +97,157 @@ func (o *Optimizer) Optimize(code []Instruction) []Instruction {
 	o.mutex.Unlock()
 
 	return optimized
+}
+
+func (o *Optimizer) optimizePlatformSpecific(code []Instruction) []Instruction {
+	switch o.platform {
+	case PlatformX86:
+		return o.optimizeX86(code)
+	case PlatformARM:
+		return o.optimizeARM(code)
+	case PlatformARM64:
+		return o.optimizeARM64(code)
+	case PlatformWASM:
+		return o.optimizeWASM(code)
+	default:
+		return code
+	}
+}
+
+func (o *Optimizer) optimizeX86(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+2 < len(code) {
+			switch code[i].Op {
+			case ADD, SUB, MUL, DIV:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignValue(code[i].Value),
+					})
+					continue
+				}
+			case LOAD, STORE:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignAddress(code[i].Value),
+					})
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeARM(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+2 < len(code) {
+			switch code[i].Op {
+			case ADD, SUB:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignValue(code[i].Value),
+					})
+					continue
+				}
+			case LOAD, STORE:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignAddress(code[i].Value),
+					})
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeARM64(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+2 < len(code) {
+			switch code[i].Op {
+			case ADD, SUB, MUL, DIV:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignValue(code[i].Value),
+					})
+					continue
+				}
+			case LOAD, STORE:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignAddress(code[i].Value),
+					})
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) optimizeWASM(code []Instruction) []Instruction {
+	var result []Instruction
+	for i := 0; i < len(code); i++ {
+		if i+2 < len(code) {
+			switch code[i].Op {
+			case ADD, SUB, MUL, DIV:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignValue(code[i].Value),
+					})
+					continue
+				}
+			case LOAD, STORE:
+				if o.isAligned(code[i:]) {
+					result = append(result, Instruction{
+						Op:    code[i].Op,
+						Value: o.alignAddress(code[i].Value),
+					})
+					continue
+				}
+			}
+		}
+		result = append(result, code[i])
+	}
+	return result
+}
+
+func (o *Optimizer) isAligned(instrs []Instruction) bool {
+	if len(instrs) < 2 {
+		return false
+	}
+	if addr, ok := instrs[0].Value.(int); ok {
+		return addr%o.alignment == 0
+	}
+	return false
+}
+
+func (o *Optimizer) alignValue(value interface{}) interface{} {
+	if addr, ok := value.(int); ok {
+		return (addr + o.alignment - 1) & ^(o.alignment - 1)
+	}
+	return value
+}
+
+func (o *Optimizer) alignAddress(value interface{}) interface{} {
+	if addr, ok := value.(int); ok {
+		return (addr + o.alignment - 1) & ^(o.alignment - 1)
+	}
+	return value
 }
 
 func (o *Optimizer) optimizeConstantFolding(code []Instruction) []Instruction {
